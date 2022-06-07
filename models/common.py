@@ -26,13 +26,106 @@ from utils.general import (LOGGER, check_requirements, check_suffix, check_versi
                            make_divisible, non_max_suppression, scale_coords, xywh2xyxy, xyxy2xywh)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import copy_attr, time_sync
-
+from models.swin import *
 
 def autopad(k, p=None):  # kernel, padding
     # Pad to 'same'
     if p is None:
         p = k // 2 if isinstance(k, int) else (x // 2 for x in k)  # auto-pad
     return p
+
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+class h_swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_swish, self).__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+    def forward(self, x):
+        return x * self.sigmoid(x)
+class CoordAtt(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
+        super(CoordAtt, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(8, inp // reduction)
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+        out = identity * a_w * a_h
+        return out
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.f1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.f2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        avg_out = self.f2(self.relu(self.f1(self.avg_pool(x))))
+        max_out = self.f2(self.relu(self.f1(self.max_pool(x))))
+        out = self.sigmoid(avg_out + max_out)
+        return out
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv(x)
+        return self.sigmoid(x)
+class CBAM(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, ratio=16, kernel_size=7):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super(CBAM, self).__init__()
+        self.channel_attention = ChannelAttention(c1, ratio)
+        self.spatial_attention = SpatialAttention(kernel_size)
+    def forward(self, x):
+        out = self.channel_attention(x) * x
+        out = self.spatial_attention(out) * out
+        return out
+class SE(nn.Module):
+    def __init__(self, c1, c2, r=16):
+        super(SE, self).__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.l1 = nn.Linear(c1, c1 // r, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.l2 = nn.Linear(c1 // r, c1, bias=False)
+        self.sig = nn.Sigmoid()
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avgpool(x).view(b, c)
+        y = self.l1(y)
+        y = self.relu(y)
+        y = self.l2(y)
+        y = self.sig(y)
+        y = y.view(b, c, 1, 1)
+        return x * y.expand_as(x)
 
 
 class Conv(nn.Module):
@@ -72,6 +165,124 @@ class TransformerLayer(nn.Module):
         x = self.fc2(self.fc1(x)) + x
         return x
 
+class SwimLayer(nn.Module):
+    """
+    A basic Swin Transformer layer for one stage.
+
+    Args:
+        dim (int): Number of input channels.
+        depth (int): Number of blocks.
+        num_heads (int): Number of attention heads.
+        window_size (int): Local window size.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+    """
+
+    def __init__(self, c, num_heads):
+        super().__init__()
+        self.num_heads=num_heads
+        self.mlp_ratio=4.
+        self.qkv_bias=True
+        self.drop=0.
+        self.attn_drop=0.
+        self.drop_path=0.
+        self.norm_layer=nn.LayerNorm
+        self.downsample = None
+        self.use_checkpoint=False
+        self.dim = c
+        self.depth = 1
+        self.window_size = 7
+        self.use_checkpoint = self.use_checkpoint
+        self.shift_size = 7 // 2
+
+        # build blocks
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock(
+                dim=self.dim,
+                num_heads=self.num_heads,
+                window_size=self.window_size,
+                shift_size=0 if (i % 2 == 0) else self.shift_size,
+                mlp_ratio=self.mlp_ratio,
+                qkv_bias=self.qkv_bias,
+                drop=self.drop,
+                attn_drop=self.attn_drop,
+                drop_path=self.drop_path[i] if isinstance(self.drop_path, list) else self.drop_path,
+                norm_layer=self.norm_layer)
+            for i in range(self.depth)])
+
+        # patch merging layer
+        #         if downsample is not None:
+
+        #     self.downsample = nn.downsample(dim=self.dim, norm_layer=self.norm_layer)
+        # else:
+        #     self.downsample = None
+
+    def create_mask(self, x, H, W):
+        # calculate attention mask for SW-MSA
+        # 保证Hp和Wp是window_size的整数倍
+        Hp = int(np.ceil(H / self.window_size)) * self.window_size
+        Wp = int(np.ceil(W / self.window_size)) * self.window_size
+        # 拥有和feature map一样的通道排列顺序，方便后续window_partition
+        img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # [1, Hp, Wp, 1]
+        h_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+
+        mask_windows = window_partition(img_mask, self.window_size)  # [nW, Mh, Mw, 1]
+        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)  # [nW, Mh*Mw]
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)  # [nW, 1, Mh*Mw] - [nW, Mh*Mw, 1]
+        # [nW, Mh*Mw, Mh*Mw]
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        return attn_mask
+
+    def forward(self, x, H, W):
+        attn_mask = self.create_mask(x, H, W)  # [nW, Mh*Mw, Mh*Mw]
+        for blk in self.blocks:
+            blk.H, blk.W = H, W
+            if not torch.jit.is_scripting() and self.use_checkpoint:
+                x = checkpoint.checkpoint(blk, x, attn_mask)
+            else:
+                x = blk(x, attn_mask)
+        if self.downsample is not None:
+            x = self.downsample(x, H, W)
+            H, W = (H + 1) // 2, (W + 1) // 2
+
+        return x
+
+
+class SWIM(nn.Module):
+    def __init__(self, c1, c2, num_heads, num_layers):
+        super().__init__()
+        self.conv = None
+        if c1 != c2:
+            self.conv = Conv(c1, c2)
+        self.pos_drop = nn.Dropout(p=0)
+        self.linear = nn.Linear(c2, c2)  # learnable position embedding
+        #self.linear = PatchEmbed(4, c2, c2, None)  # learnable position embedding
+        self.c2 = c2
+        self.tr = nn.Sequential(*(SwimLayer(c2, num_heads) for _ in range(num_layers)))
+    def forward(self, x):
+        if self.conv is not None:
+            x = self.conv(x)
+        b, _, w, h = x.shape
+        p, H, W = self.linear(x)
+        q = self.tr(p, H, W)
+      #  p = x.flatten(2).permute(2, 0, 1)
+        return q.permute(1, 2, 0).reshape(b, self.c2, w, h)
 
 class TransformerBlock(nn.Module):
     # Vision Transformer https://arxiv.org/abs/2010.11929
@@ -88,7 +299,7 @@ class TransformerBlock(nn.Module):
         if self.conv is not None:
             x = self.conv(x)
         b, _, w, h = x.shape
-        p = x.flatten(2).permute(2, 0, 1)
+        p = x.flatten(2).permute(2, 0, 1) # w*h,c,b -> w*h+p,c,b ->c,w*h+p,b
         return self.tr(p + self.linear(p)).permute(1, 2, 0).reshape(b, self.c2, w, h)
 
 
@@ -145,6 +356,14 @@ class C3TR(C3):
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)
         self.m = TransformerBlock(c_, c_, 4, n)
+
+
+class C3SWIM(C3):
+    # C3 module with TransformerBlock()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = SWIM(c_, c_, 4, n)
 
 
 class C3SPP(C3):
@@ -531,7 +750,7 @@ class AutoShape(nn.Module):
         #   multiple:        = [Image.open('image1.jpg'), Image.open('image2.jpg'), ...]  # list of images
 
         t = [time_sync()]
-        p = next(self.model.parameters()) if self.pt else torch.zeros(1)  # for device and type
+        p = next(self.model.parameters()) if self.pt else torch.zeros(1, device=self.model.device)  # for device, type
         autocast = self.amp and (p.device.type != 'cpu')  # Automatic Mixed Precision (AMP) inference
         if isinstance(imgs, torch.Tensor):  # torch
             with amp.autocast(autocast):
@@ -629,7 +848,7 @@ class Detections:
 
             im = Image.fromarray(im.astype(np.uint8)) if isinstance(im, np.ndarray) else im  # from np
             if pprint:
-                LOGGER.info(s.rstrip(', '))
+                print(s.rstrip(', '))
             if show:
                 im.show(self.files[i])  # show
             if save:
@@ -646,8 +865,7 @@ class Detections:
 
     def print(self):
         self.display(pprint=True)  # print results
-        LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {tuple(self.s)}' %
-                    self.t)
+        print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {tuple(self.s)}' % self.t)
 
     def show(self, labels=True):
         self.display(show=True, labels=labels)  # show results
@@ -684,7 +902,11 @@ class Detections:
         return x
 
     def __len__(self):
-        return self.n
+        return self.n  # override len(results)
+
+    def __str__(self):
+        self.print()  # override print(results)
+        return ''
 
 
 class Classify(nn.Module):
